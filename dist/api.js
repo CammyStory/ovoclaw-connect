@@ -69,6 +69,25 @@ export async function connect(host, slug, body) {
         body: JSON.stringify(body),
     });
 }
+// Silently mint a fresh bearer token from the long-lived client_secret — no
+// owner re-approval, same shadow user / conversation / history. The bearer
+// token only lives ~1h; the secret never expires, so this keeps a connection
+// alive indefinitely. `introduction` is required by the endpoint but ignored on
+// the reauth path (the server returns before any message is created). Any
+// status other than 'reauthorized' means the connection is gone (the owner
+// disconnected you, or the secret no longer matches) → surfaced as
+// session_expired so the caller reconnects with the invite.
+export async function reauthorize(host, slug, clientUserId, clientSecret) {
+    const res = await connect(host, slug, {
+        introduction: 'token refresh',
+        client_user_id: clientUserId,
+        client_secret: clientSecret,
+    });
+    if (res.status === 'reauthorized' && res.token && res.token_expires_at) {
+        return { token: res.token, token_expires_at: res.token_expires_at };
+    }
+    throw makeError('session_expired', `could not refresh the session (status: ${String(res.status ?? 'unknown')}) — the owner may have disconnected you. Reconnect with the invite.`);
+}
 export async function pollConnect(host, slug, requestId) {
     return jsonFetch(`${host}/connect/${encodeURIComponent(slug)}/poll/${encodeURIComponent(requestId)}`, { method: 'GET' });
 }

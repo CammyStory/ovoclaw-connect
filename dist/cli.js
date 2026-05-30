@@ -3,10 +3,10 @@ import { promises as fs, constants as fsConstants } from 'node:fs';
 import { platform, arch } from 'node:os';
 import { parseArgs, requireString, optionalString, optionalInt, CliError } from './argparse.js';
 import { parseInvite } from './invite.js';
-import { connect, getManifest, pollConnect, pollReplies, sendMessage, } from './api.js';
+import { connect, getManifest, pollConnect, pollReplies, reauthorize, sendMessage, } from './api.js';
 import { STATE_DIR, STATE_FILE, deleteSession, getSession, listSessions, newHandle, saveSession, updateSession, } from './state.js';
 const SKILL_NAME = 'ovoclaw-connect';
-const SKILL_VERSION = '1.0.0';
+const SKILL_VERSION = '1.0.1';
 const DEFAULT_API_BASE = 'https://ovo.ovoclaw.com';
 // ── Output contract ────────────────────────────────────────────────────
 // Every successful invocation prints exactly ONE JSON object to stdout
@@ -134,6 +134,37 @@ function sanitizeConnectResponse(res) {
     const { token: _t, client_secret: _cs, ...safe } = res;
     return safe;
 }
+// Refresh the session's bearer token when it's expired or within this skew, so
+// a command never starts with a token about to lapse mid-request.
+const TOKEN_REFRESH_SKEW_MS = 60_000;
+// Return the session with a fresh bearer token, silently reauthorizing via the
+// stored client_secret when the current token is expired/near-expiry. The
+// rotated token is persisted so the next command reuses it.
+async function freshToken(sess) {
+    if (new Date(sess.tokenExpiresAt).getTime() - Date.now() > TOKEN_REFRESH_SKEW_MS)
+        return sess;
+    const { token, token_expires_at } = await reauthorize(sess.host, sess.slug, sess.clientUserId, sess.clientSecret);
+    const updated = { ...sess, token, tokenExpiresAt: token_expires_at };
+    await saveSession(updated);
+    return updated;
+}
+// Run a token-bearing call with auto-refresh: refresh proactively first, and if
+// the call is still rejected (401 → session_expired, e.g. revoked mid-flight),
+// reauthorize once and retry. A genuine dead connection surfaces session_expired.
+async function withFreshToken(sess, fn) {
+    let s = await freshToken(sess);
+    try {
+        return await fn(s);
+    }
+    catch (e) {
+        if (e.code !== 'session_expired')
+            throw e;
+        const { token, token_expires_at } = await reauthorize(s.host, s.slug, s.clientUserId, s.clientSecret);
+        s = { ...s, token, tokenExpiresAt: token_expires_at };
+        await saveSession(s);
+        return await fn(s);
+    }
+}
 async function cmdSendMessage(flags) {
     const handle = requireString(flags, 'session', 'send-message');
     const content = requireString(flags, 'content', 'send-message');
@@ -141,7 +172,7 @@ async function cmdSendMessage(flags) {
     if (!sess) {
         throw new CliError(`Unknown --session "${handle}". Use list-sessions to see active handles, or connect first.`);
     }
-    const res = await sendMessage(sess.host, sess.token, content);
+    const res = await withFreshToken(sess, (s) => sendMessage(s.host, s.token, content));
     ok({
         ok: res.ok,
         message_id: res.message?.id,
@@ -158,7 +189,7 @@ async function cmdCheckReplies(flags) {
     const sess = await getSession(handle);
     if (!sess)
         throw new CliError(`Unknown --session "${handle}".`);
-    const res = await pollReplies(sess.host, sess.token, sess.lastSeq, wait);
+    const res = await withFreshToken(sess, (s) => pollReplies(s.host, s.token, s.lastSeq, wait));
     if (res.last_seq > sess.lastSeq) {
         await updateSession(sess.handle, { lastSeq: res.last_seq });
     }
